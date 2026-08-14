@@ -66,7 +66,7 @@ if [ -z "$BYPASS_ARGS" ]; then
   BYPASS_ARGS="-l '$S/config.js' -l '$S/android-proxy-override.js' \
 -l '$S/android-system-certificate-injection.js' -l '$S/android-certificate-unpinning.js' \
 -l '$S/android-certificate-unpinning-fallback.js' -l '$S/android-disable-root-detection.js' \
--l '$S/android-anti-detection.js'"
+-l '$S/android-anti-detection.js' -l '$S/android-facetec-init-bypass.js'"
 fi
 
 # Spawning under the full hook chain occasionally loses a race and the app dies

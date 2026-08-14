@@ -42,6 +42,8 @@ SCRIPTS = [
      "Hide su binaries, root manager packages, Runtime.exec(\"su\")"),
     ("anti-detection", "android-anti-detection.js",
      "Emulator/VM, debugger, tracer and Frida detection"),
+    ("facetec-init-bypass", "android-facetec-init-bypass.js",
+     "Force FaceTec SDK init success (defeats its own native device-integrity check)"),
 ]
 
 ANTI_MODULES = [

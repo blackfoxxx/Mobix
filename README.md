@@ -48,6 +48,7 @@ command.
 - [Web pentest with Burp](#web-pentest-with-burp)
 - [Inspecting one app's traffic](#inspecting-one-apps-traffic)
 - [Claude Code engagements (`mp engage`)](#claude-code-engagements-mp-engage)
+- [Mobile pentest skill](#mobile-pentest-skill)
 - [Sessions & resuming](#sessions--resuming)
 - [Logging in](#logging-in)
 - [Site map & Repeater](#site-map--repeater)
@@ -549,9 +550,23 @@ you're looking elsewhere, and opening the tab jumps straight to it.
 
 **Interactive mode** opens a real `claude` session in Terminal.app in that
 folder, with full skills, plugins, permissions and MCP. **`--auto` mode** runs a
-headless agent (analysis-only allowlist: the `mp-traffic` MCP tools plus
-Read/Write/Grep/Skill, **no Bash, no request sending**) that streams events to
-`scan.log` and writes findings as it goes.
+headless agent restricted to the 6 read-only `traffic_*` tools plus
+Read/Write/Grep/Skill, **no Bash, no request sending**. That restriction is
+enforced with an explicit `--disallowedTools` deny list, not just by leaving
+everything else off an allow list: in headless mode a tool call outside
+`--allowedTools` isn't automatically blocked, it can go through with no one
+there to prompt for it. This was a real gap (Bash executed successfully in a
+test run before the deny list was added), not a hypothetical one, which is
+why the deny list names every non-traffic tool explicitly, Bash included,
+rather than trusting the allow list alone. It streams events to `scan.log`
+and writes findings as it goes.
+
+Both modes are pointed at **`.claude/skills/mobile-pentest/`**, shipped with
+this repo: the methodology (what's confirmable from traffic alone versus
+what needs an interactive session), the finding write-up format, and a
+severity rubric, all grounded in Mobix's actual tools rather than generic
+advice. `mp engage` explicitly tells the agent to load it first. See
+[Mobile pentest skill](#mobile-pentest-skill) below.
 
 The **Claude Analysis** tab in the dashboard drives both: Start analysis, Open
 interactive, Stop, a live findings list with a reader, and the agent's current
@@ -566,6 +581,42 @@ flow numbers and a read-only confirmation test.
 Note: the agent's first message can trip the broad model safeguard on
 cyber-security phrasing; it auto-falls-back to another model and continues. The
 prompt is framed as a security review of already-captured data to minimise this.
+
+## Mobile pentest skill
+
+`.claude/skills/mobile-pentest/` ships with this repo, so a fresh clone gets a
+genuinely knowledgeable pentest agent out of the box, not one that depends on
+whatever security-review skills happen to already be installed on whoever's
+machine is running it. Both `mp engage` modes load it explicitly as their
+first action.
+
+It's Android-only, matching what this lab actually does. No iOS guidance, no
+jailbreak tooling. The main `SKILL.md` is a mode-aware workflow: it tells the
+agent to check up front whether it's interactive (full tool access) or the
+`--auto` agent (traffic-only, read-only), then walks through attack surface
+mapping, authorization and IDOR, session/token handling, data exposure,
+business logic, and, interactive-only, local storage, IPC/deep links, and
+verifying the app's own client-side protections actually engaged.
+
+Six reference files under `references/` go deeper on each category, and are
+explicit throughout about what's **confirmed** straight from a captured flow
+versus what's a **candidate** that needs an interactive Repeater test to
+prove, the same confirmed/candidate discipline the finding write-up format
+enforces. A few examples of what "grounded in this lab's actual tools" means
+in practice rather than generic advice: `idor_candidates` and `authenticated`
+are already computed per-flow by the capture feed, so the skill treats
+*inconsistent* enforcement (same endpoint shape, auth present on some calls
+and not others) as a stronger signal than uniform exposure; a `Set-Cookie`
+missing `Secure`/`HttpOnly` is confirmable directly from response headers,
+no active test needed; and a custom request-integrity field (the `macIn`
+pattern) points back to this README's own section on it rather than
+duplicating that guidance.
+
+Verified against a real, previously-authorised production target in this
+lab: the agent loaded the skill first, read every reference file before
+writing anything, pulled full detail on every relevant flow individually
+rather than skimming the brief, and correctly declined to write up an IDOR
+candidate until it could point to the specific flow that would confirm it.
 
 ## Sessions & resuming
 
@@ -738,10 +789,12 @@ stored value into the on-device field currently focused without ever echoing
 it back.
 
 The headless `--auto` engagement agent (below) keeps its original safety
-property regardless of this expansion: its `--allowedTools` allowlist names
-the 6 `traffic_*` tools explicitly, not a wildcard, so it still can't reach
-any of the new mutating tools: no Bash, no request sending, no scan/switch/
-credential actions.
+property regardless of this expansion, but not from the allow list alone:
+`--disallowedTools` explicitly denies Bash and all 30 non-traffic MCP tools
+by name (see [Claude Code engagements](#claude-code-engagements-mp-engage)
+for why the allow list by itself isn't enough in headless mode). It still
+can't reach any of the new mutating tools: no Bash, no request sending, no
+scan/switch/credential actions.
 
 Re-register after moving the directory:
 `claude mcp add --scope user mobix ~/mobile-pentest/bin/mp-mcp`

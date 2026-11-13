@@ -47,12 +47,13 @@ command.
 - [Where the requests are](#where-the-requests-are)
 - [Web pentest with Burp](#web-pentest-with-burp)
 - [Inspecting one app's traffic](#inspecting-one-apps-traffic)
-- [Claude Code engagements (`mp engage`)](#claude-code-engagements-mp-engage)
+- [Engagements (`mp engage`)](#engagements-mp-engage)
 - [Mobile pentest skill](#mobile-pentest-skill)
 - [Sessions & resuming](#sessions--resuming)
 - [Logging in](#logging-in)
 - [Site map & Repeater](#site-map--repeater)
-- [Wiring traffic into Claude Code (lightweight)](#wiring-traffic-into-claude-code-lightweight)
+- [Wiring traffic into your AI tool (lightweight)](#wiring-traffic-into-your-ai-tool-lightweight)
+- [Bring your own model / OpenRouter](#bring-your-own-model--openrouter)
 - [Static analysis](#static-analysis)
 - [Runtime exploration](#runtime-exploration)
 - [Installing an app](#installing-an-app)
@@ -206,7 +207,7 @@ remaining actions.
 
 **Claude Analysis**: the live findings list from an `mp engage` run (interactive
 or `--auto`), with a hero card for the latest finding and a live-activity feed.
-See [Claude Code engagements](#claude-code-engagements-mp-engage).
+See [Engagements](#engagements-mp-engage).
 
 **Sessions**: every past capture session and Claude Code engagement, browsable
 read-only, forever. A new scan never deletes anything. See
@@ -523,60 +524,85 @@ app X". Traffic from background OS services during that window is tagged the
 same way. Combine with `mp scope <host>` when you need certainty about which
 traffic is really the target's.
 
-## Claude Code engagements (`mp engage`)
+## Engagements (`mp engage`)
 
-Beyond one-shot analysis, `mp engage` starts a **full Claude Code session** for a
+Beyond one-shot analysis, `mp engage` starts a **full agent session** for a
 target: its own folder, live traffic wired in via MCP, and the pentest
-skills/plugins active exactly as in a hand-started session.
+skills/plugins active exactly as in a hand-started session. It defaults to
+Claude Code, but **OpenCode** and **Codex CLI** work too:
 
 ```bash
-mp engage                 # interactive session in a new Terminal, in the target folder
-mp engage <pkg> --auto    # headless agent: reviews the live capture, writes findings
-mp engage --stop          # stop running agents
+mp engage                          # interactive session in a new Terminal, in the target folder
+mp engage <pkg> --auto             # headless agent: reviews the live capture, writes findings
+mp engage <pkg> --tool opencode    # same, driven by OpenCode instead of Claude Code
+mp engage <pkg> --tool codex       # same, driven by Codex CLI (interactive only - see below)
+mp engage --stop                   # stop running agents
 ```
+
+`--tool` defaults to `AGENT_TOOL` in `config` if set, otherwise `claude`.
+
+| | `claude` | `opencode` | `codex` |
+|---|---|---|---|
+| Interactive mode | yes | yes | yes |
+| `--auto` headless mode | yes | yes | **no, see below** |
+| `--resume` | yes | no | no |
+| Skill it loads | `.claude/skills/mobile-pentest/` | `.claude/skills/mobile-pentest/` (OpenCode auto-loads Claude Code skills natively) | `.agents/skills/mobile-pentest/` (vendor-neutral copy) |
 
 Each run creates `engagements/<pkg>_<timestamp>/` seeded with:
 - `CLAUDE.md`: target, scope, authorisation, and how to reach the live traffic tools
 - `traffic/`: symlink to the live capture session, plus a `BRIEF.md` snapshot
 - `findings/`: where the agent writes one report per issue
 
-The dashboard's **Claude Analysis** tab tracks BOTH modes live, including an
-**interactive session you're driving by hand in Terminal**. It polls
-`engagements/<latest>/findings/` regardless of who's writing to it, sorts newest
-first (not alphabetically, so a fresh Critical isn't buried under older Lows),
-and shows a **Latest finding** card at the top with severity and age. A small
-dot appears on the **Claude Scan** nav tab whenever a new finding lands while
-you're looking elsewhere, and opening the tab jumps straight to it.
+The dashboard's **Claude Analysis** tab tracks Claude Code engagements (both
+modes, including an interactive session you're driving by hand in Terminal)
+live: it polls `engagements/<latest>/findings/` regardless of who's writing to
+it, sorts newest first (not alphabetically, so a fresh Critical isn't buried
+under older Lows), and shows a **Latest finding** card at the top with
+severity and age. A small dot appears on the **Claude Scan** nav tab whenever
+a new finding lands while you're looking elsewhere, and opening the tab jumps
+straight to it. OpenCode and Codex engagements write findings in the same
+format to the same folder, but the dashboard's Start/Stop/Open-interactive
+buttons aren't wired to them yet - drive those two from the CLI for now.
 
-**Interactive mode** opens a real `claude` session in Terminal.app in that
-folder, with full skills, plugins, permissions and MCP. **`--auto` mode** runs a
-headless agent restricted to the 6 read-only `traffic_*` tools plus
-Read/Write/Grep/Skill, **no Bash, no request sending**. That restriction is
-enforced with an explicit `--disallowedTools` deny list, not just by leaving
+**Interactive mode** opens a real `claude`/`opencode`/`codex` session in
+Terminal.app in that folder, with full tool access, permissions and MCP -
+functionally identical to starting that CLI by hand in the engagement
+folder. **`--auto` mode** (claude/opencode only) runs a headless agent
+restricted to the 6 read-only `traffic_*` tools plus Read/Write/Grep/Skill,
+**no Bash, no request sending**. For Claude Code that restriction is enforced
+with an explicit `--disallowedTools` deny list, not just by leaving
 everything else off an allow list: in headless mode a tool call outside
 `--allowedTools` isn't automatically blocked, it can go through with no one
 there to prompt for it. This was a real gap (Bash executed successfully in a
 test run before the deny list was added), not a hypothetical one, which is
 why the deny list names every non-traffic tool explicitly, Bash included,
-rather than trusting the allow list alone. It streams events to `scan.log`
-and writes findings as it goes.
+rather than trusting the allow list alone. For OpenCode the same boundary is
+declared in `.opencode/agent/mobix-auto.md`'s permission block (`bash: deny`
+plus every mutating MCP tool), verified the same way: forceful, explicit
+instructions to invoke Bash produced zero tool-call attempts across repeated
+trials. Both stream events to `scan.log` and write findings as they go.
 
-Both modes are pointed at **`.claude/skills/mobile-pentest/`**, shipped with
-this repo: the methodology (what's confirmable from traffic alone versus
-what needs an interactive session), the finding write-up format, and a
+**Why Codex has no `--auto`.** Codex CLI has no per-tool allow/deny list like
+the other two - its only headless safety knob is a coarser `--sandbox`
+(filesystem + network scope), and that boundary hasn't been verified live in
+this lab. Rather than give `--auto` a different, weaker meaning depending on
+`--tool`, Codex is interactive-only until that's actually confirmed: a human
+approves every command Codex runs, the same way a normal `codex` session
+would. If you verify Codex's sandbox boundary yourself and want to add
+`--auto` support, `scripts/engage.sh` has a comment at the top explaining
+exactly what would need confirming first.
+
+Both `.claude/skills/mobile-pentest/` and `.agents/skills/mobile-pentest/` are
+pointed at identical methodology (what's confirmable from traffic alone
+versus what needs an interactive session), finding write-up format, and
 severity rubric, all grounded in Mobix's actual tools rather than generic
-advice. `mp engage` explicitly tells the agent to load it first. See
-[Mobile pentest skill](#mobile-pentest-skill) below.
+advice - they're kept in sync by hand, see [Mobile pentest skill](#mobile-pentest-skill)
+below. `mp engage` explicitly tells the agent to load the right one first.
 
-The **Claude Analysis** tab in the dashboard drives both: Start analysis, Open
-interactive, Stop, a live findings list with a reader, and the agent's current
-activity. The Traffic tab's **Scan with Claude** button starts an auto-scan on
-the current session.
-
-In a real engagement the auto agent produced 8 findings unattended: BOLA/IDOR
-on ObjectId-addressed endpoints, an HS256 JWT carrying PII, mass assignment,
-wildcard CORS, and an unauthenticated CodePush OTA channel, each with evidence
-flow numbers and a read-only confirmation test.
+In a real engagement the Claude Code auto agent produced 8 findings
+unattended: BOLA/IDOR on ObjectId-addressed endpoints, an HS256 JWT carrying
+PII, mass assignment, wildcard CORS, and an unauthenticated CodePush OTA
+channel, each with evidence flow numbers and a read-only confirmation test.
 
 Note: the agent's first message can trip the broad model safeguard on
 cyber-security phrasing; it auto-falls-back to another model and continues. The
@@ -587,8 +613,12 @@ prompt is framed as a security review of already-captured data to minimise this.
 `.claude/skills/mobile-pentest/` ships with this repo, so a fresh clone gets a
 genuinely knowledgeable pentest agent out of the box, not one that depends on
 whatever security-review skills happen to already be installed on whoever's
-machine is running it. Both `mp engage` modes load it explicitly as their
-first action.
+machine is running it. Claude Code and OpenCode both read this copy (OpenCode
+auto-loads Claude Code skills natively); Codex has no equivalent
+auto-discovery, so there's an identical copy at
+`.agents/skills/mobile-pentest/` for it, byte-identical today and kept in
+sync by hand if either one changes. Every `mp engage` combination loads the
+right one explicitly as its first action.
 
 It's Android-only, matching what this lab actually does. No iOS guidance, no
 jailbreak tooling. The main `SKILL.md` is a mode-aware workflow: it tells the
@@ -634,8 +664,9 @@ targets the live session, but "Repeat this request" still works, fetching from
 the archived one.
 
 **CLI.** `mp sessions` lists the 15 most recent capture sessions with their
-tagged target, flow count, and disk size, plus a count of Claude Code
-engagements.
+tagged target, flow count, and disk size, plus a count of agent engagements
+(any `--tool`; `--resume` itself still only works on `claude`-tool ones, see
+below).
 
 **Resuming an engagement.** Every `mp engage` run (interactive or `--auto`)
 now pins a `claude --session-id` and saves it to `.session_id` in the
@@ -748,20 +779,38 @@ testing with a guessed ID the capture never actually saw.
 Nothing here is a dry run. **Send** transmits immediately. Treat it with the
 same care as `replay.py --send`: know what you're sending before you click it.
 
-## Wiring traffic into Claude Code (lightweight)
+## Wiring traffic into your AI tool (lightweight)
 
-Three routes, increasing directness:
+Three routes, increasing directness. This section is about registering
+`bin/mp-mcp` for ad-hoc chat use in *any* directory, driven by hand - it's
+separate from `mp engage`, which wires it into a dedicated per-target
+engagement folder automatically (see [Engagements](#engagements-mp-engage)
+above).
 
 **1. MCP server, full control plane.** `bin/mp-mcp` is a single MCP server
 (36 tools) covering both traffic analysis and everything the CLI/dashboard can
-do. Register it once and drive the whole lab from chat:
+do. Register it once and drive the whole lab from chat, in whichever of the
+three tools you use:
 
 ```bash
-claude mcp add --scope user mobix ~/mobile-pentest/bin/mp-mcp
+claude mcp add --scope user mobix ~/mobile-pentest/bin/mp-mcp     # Claude Code
+opencode mcp add mobix --global -- ~/mobile-pentest/bin/mp-mcp    # OpenCode
+codex mcp add mobix -- ~/mobile-pentest/bin/mp-mcp                # Codex CLI
 ```
 
 *(Already registered it under the old name? `mp-traffic` still works, same
 binary and same tools, just a different local alias. No need to re-add.)*
+
+Running **OpenCode from this repo's directory** already has it, with no
+registration step: `opencode.jsonc` at the repo root declares it as a
+project-scoped MCP server, which OpenCode auto-discovers there. Codex CLI has
+no equivalent project-config auto-discovery, and `codex mcp add` only writes
+to the global `~/.codex/config.toml` shown above - there's no `--project`
+flag for it. (`mp engage --tool codex` sidesteps needing either: it wires the
+server in per-invocation via `-c mcp_servers.mp-traffic.command=...` on the
+`codex` command line itself, touching neither config file - see
+`scripts/engage.sh`.) `--scope user`/`--global` above are for reaching it
+from *other* directories with Claude Code or OpenCode.
 
 | group | tools | what it does |
 |---|---|---|
@@ -791,7 +840,7 @@ it back.
 The headless `--auto` engagement agent (below) keeps its original safety
 property regardless of this expansion, but not from the allow list alone:
 `--disallowedTools` explicitly denies Bash and all 30 non-traffic MCP tools
-by name (see [Claude Code engagements](#claude-code-engagements-mp-engage)
+by name (see [Engagements](#engagements-mp-engage)
 for why the allow list by itself isn't enough in headless mode). It still
 can't reach any of the new mutating tools: no Bash, no request sending, no
 scan/switch/credential actions.
@@ -845,6 +894,53 @@ matters when the target is a live payment system.
 If the body carries a `macIn` field the harness re-signs it automatically via
 `scripts/zc-macin.py`, so patched requests stay valid. For targets without a
 signature the signer is simply absent and the body passes through unchanged.
+
+## Bring your own model / OpenRouter
+
+`--tool` picks the CLI that drives the engagement; which *model* that CLI
+talks to is a separate, orthogonal choice this lab doesn't touch at all -
+OpenCode and Codex CLI both support custom OpenAI-compatible backends
+(OpenRouter, a local vLLM/Ollama/llama.cpp server, etc.) in their own
+config, so pointing `mp engage --tool opencode` or `--tool codex` at one is
+just a matter of configuring that tool normally before running `mp engage`.
+Claude Code has no such mechanism - it only talks to Anthropic's API - so
+this only applies to `--tool opencode`/`--tool codex`.
+
+**OpenCode.** Add a provider to `opencode.jsonc` (project-level, in this repo,
+or `~/.config/opencode/opencode.jsonc` for every project) using the
+`@ai-sdk/openai-compatible` connector and any base URL:
+
+```jsonc
+{
+  "provider": {
+    "openrouter": {
+      "name": "OpenRouter",
+      "npm": "@ai-sdk/openai-compatible",
+      "options": { "baseURL": "https://openrouter.ai/api/v1" },
+      "models": { "anthropic/claude-sonnet-4.5": { "name": "Claude Sonnet 4.5 (via OpenRouter)" } }
+    }
+  }
+}
+```
+
+then `OPENROUTER_API_KEY=sk-or-... mp engage <pkg> --tool opencode`. The exact
+same shape works for any other OpenAI-compatible endpoint - swap the
+`baseURL` and model id. OpenCode may also have a built-in `openrouter`
+integration you can set up with `opencode auth login openrouter` instead of
+hand-writing the block above; check `opencode auth login --help` for what
+your installed version offers.
+
+**Codex CLI.** Custom backends go in `~/.codex/config.toml` under
+`[model_providers.<id>]` (`base_url`, `env_key`, `wire_api`, etc. - run
+`codex doctor` or check Codex's own docs for the full field list for your
+installed version), then select it with `model_provider = "<id>"` either in
+the base config or a `--profile` overlay. **Verify `wire_api` against your
+own install before relying on this**: the Codex build this was written
+against rejects `wire_api = "chat"` outright ("no longer supported"), which
+is the setting most OpenAI-Chat-Completions-shaped backends (OpenRouter
+included) need - the standalone open-source Codex CLI may differ from the
+one this was checked against. If `chat` doesn't work on yours, check whether
+your provider also offers an OpenAI *Responses*-API-compatible endpoint.
 
 ## Static analysis
 

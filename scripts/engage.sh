@@ -1,35 +1,56 @@
 #!/usr/bin/env bash
-# Spin up a real Claude Code engagement for a target app.
+# Spin up a real AI-agent engagement for a target app.
 #
 # Creates a dedicated engagement folder, seeds it with live-traffic access and
-# scope/authorisation context, then starts a full Claude Code session in it -
-# skills, plugins and the mp-traffic MCP all active, exactly like a normal
-# session. Two modes:
+# scope/authorisation context, then starts a full agent session in it - skills,
+# MCP and the chosen tool's own permissions all active. Two modes, and a
+# choice of underlying CLI:
 #
-#   engage.sh [pkg]           interactive session in a new Terminal window
-#   engage.sh [pkg] --auto    headless agent that scans in the background,
-#                             streaming to scan.log and writing findings/
+#   engage.sh [pkg]                      interactive session in a new Terminal window
+#   engage.sh [pkg] --auto               headless agent, streaming to scan.log
+#   engage.sh [pkg] --tool opencode       use OpenCode instead of Claude Code
+#   engage.sh [pkg] --tool codex          use Codex CLI instead of Claude Code
 #
-# The engagement inherits the user's Claude config, so the mp-traffic MCP server
-# and the mobile-pentest skill (.claude/skills/mobile-pentest, shipped with this
-# repo: the methodology, the finding format, what's confirmable from traffic alone
-# vs. what needs an interactive session) are both available here, plus whatever
-# other security-review skills happen to be installed on this machine.
+# --tool defaults to AGENT_TOOL in config, or "claude" if unset. All three
+# read the same per-engagement CLAUDE.md and the same methodology (Claude
+# Code and OpenCode both load .claude/skills/mobile-pentest/ - OpenCode
+# auto-loads Claude Code skills natively; Codex loads the vendor-neutral copy
+# at .agents/skills/mobile-pentest/), so the methodology and finding format
+# are identical regardless of which CLI drives the session.
+#
+# --tool codex is INTERACTIVE ONLY. Claude Code's and OpenCode's --auto mode
+# both get a hard, verified boundary: an explicit tool-level deny list (see
+# the --disallowedTools comment below), so the headless agent literally
+# cannot invoke Bash or any mutating tool. Codex CLI has no per-tool
+# allow/deny of that kind - its only knob is a coarser --sandbox (filesystem
+# + network scope), and that boundary has NOT been empirically verified live
+# in this lab. Rather than give --auto a different, weaker meaning depending
+# on --tool, Codex is interactive-only (a human is present for every
+# command) until that's actually confirmed.
 set -uo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 . "$DIR/env.sh"
 
 MODE="interactive"
+TOOL=""
 PKG=""
+prev=""
 for a in "$@"; do
   case "$a" in
     --auto) MODE="auto" ;;
+    --tool) prev="tool" ;;
     -*) ;;
-    *) PKG="$a" ;;
+    *)
+      if [ "$prev" = "tool" ]; then TOOL="$a"; prev=""; else PKG="$a"; fi
+      ;;
   esac
 done
+[ -z "$TOOL" ] && TOOL=$(grep -E '^AGENT_TOOL=' "$MP_ROOT/config" 2>/dev/null | cut -d'"' -f2)
+[ -z "$TOOL" ] && TOOL="claude"
+[[ "$TOOL" =~ ^(claude|opencode|codex)$ ]] || { echo "unknown --tool: $TOOL (expected: claude, opencode, codex)" >&2; exit 1; }
 [ -z "$PKG" ] && PKG=$(grep -E '^TARGET=' "$MP_ROOT/config" 2>/dev/null | cut -d'"' -f2)
-[ -z "$PKG" ] && { echo "usage: engage.sh <package> [--auto]"; exit 1; }
+[ -z "$PKG" ] && { echo "usage: engage.sh <package> [--auto] [--tool claude|opencode|codex]"; exit 1; }
+[ "$TOOL" = "codex" ] && [ "$MODE" = "auto" ] && { echo "--tool codex is interactive-only for now: its --auto boundary isn't a verified tool-ACL like claude/opencode's (see the comment at the top of this file). Drop --auto, or use --tool claude/opencode." >&2; exit 1; }
 # PKG builds ENG (path traversal via ../ otherwise) and flows into an
 # unquoted osascript heredoc via FIRST below (AppleScript/shell injection on
 # the Mac otherwise, since bash expands the heredoc before osascript runs).
@@ -48,6 +69,7 @@ mkdir -p "$ENG/findings"
 SID=$(uuidgen | tr '[:upper:]' '[:lower:]')
 echo "$SID" > "$ENG/.session_id"
 echo "$MODE" > "$ENG/.mode"
+echo "$TOOL" > "$ENG/.tool"
 
 # Point the engagement at the live capture session (wherever the proxy is writing).
 SESS=$(ps -eo args 2>/dev/null | grep '[m]itmdump' | tr ' ' '\n' | grep -m1 '^feedout=' | cut -d= -f2-)
@@ -118,7 +140,69 @@ is analysis of existing captured data only - do not send any requests. Re-check 
 traffic_flows periodically as more data is captured."
 
 echo "[*] engagement: $ENG"
-echo "[*] target: $PKG   scope: ${SCOPE:-none}   traffic: ${SESS:+$(basename "$SESS")}"
+echo "[*] target: $PKG   scope: ${SCOPE:-none}   traffic: ${SESS:+$(basename "$SESS")}   tool: $TOOL"
+
+# $FIRST is free text (this lab's own wording, edited over time) that ends up
+# embedded in a generated shell command - for interactive mode that command
+# itself sits inside an AppleScript string, two layers of quoting. A single
+# apostrophe anywhere in $FIRST (e.g. "the skill's format", a real wording
+# choice made in this file) closes a naively-embedded single-quoted argument
+# early and leaves Terminal's shell hung at a continuation prompt waiting for
+# a quote that never comes - confirmed live, not hypothetical, and the reason
+# every interactive branch below routes the prompt through a file instead of
+# inlining it: `"$(cat ...)"` reproduces the file's content as a single
+# argument no matter what quote characters it contains.
+printf '%s' "$FIRST" > "$ENG/.first_prompt"
+
+if [ "$TOOL" = "opencode" ]; then
+  if [ "$MODE" = "auto" ]; then
+    echo "[*] starting headless OpenCode agent (analysis-only). streaming -> $ENG/scan.log"
+    # mobix-auto (.opencode/agent/mobix-auto.md, shipped with this repo) is the
+    # OpenCode equivalent of the --disallowedTools boundary above: Bash and
+    # every non-traffic mp-traffic tool are set to `deny` in its permission
+    # block, verified live the same way - forceful, explicit instructions to
+    # invoke bash produced zero tool-call attempts across repeated trials,
+    # and --auto (OpenCode's own "approve anything not explicitly denied"
+    # flag) does not loosen an explicit deny either.
+    nohup opencode run --agent mobix-auto --dir "$ENG" \
+      --format json \
+      "$(cat "$ENG/.first_prompt")" \
+      > "$ENG/scan.log" 2>&1 &
+    echo $! > "$ENG/.agent.pid"
+    echo "[+] agent pid $(cat "$ENG/.agent.pid")  -  tail -f $ENG/scan.log"
+    echo "$ENG"
+  else
+    osascript >/dev/null 2>&1 <<OSA
+tell application "Terminal"
+  activate
+  do script "cd '$ENG' && opencode --agent mobix-interactive --prompt \"\$(cat '$ENG/.first_prompt')\""
+end tell
+OSA
+    echo "[+] opened an interactive OpenCode session in Terminal, in $ENG"
+    echo "$ENG"
+  fi
+  exit 0
+fi
+
+if [ "$TOOL" = "codex" ]; then
+  # MODE can't be "auto" here - rejected above with an explanatory error.
+  # Wire the MCP server in for this invocation only, via -c, rather than
+  # `codex mcp add` (which writes into the user's own ~/.codex/config.toml
+  # globally and permanently). The value is a bare path with no TOML special
+  # characters, so it deliberately isn't quoted: -c's value is parsed as TOML
+  # first and falls back to using the raw string as a literal on parse
+  # failure (an unquoted `/...` path isn't valid TOML), which sidesteps the
+  # apostrophe/quote-nesting problem above entirely rather than fighting it.
+  osascript >/dev/null 2>&1 <<OSA
+tell application "Terminal"
+  activate
+  do script "cd '$ENG' && codex -c mcp_servers.mp-traffic.command=$MP_ROOT/bin/mp-mcp \"\$(cat '$ENG/.first_prompt')\""
+end tell
+OSA
+  echo "[+] opened an interactive Codex session in Terminal, in $ENG"
+  echo "$ENG"
+  exit 0
+fi
 
 if [ "$MODE" = "auto" ]; then
   echo "[*] starting headless agent (analysis-only). streaming -> $ENG/scan.log"
@@ -165,7 +249,7 @@ else
   osascript >/dev/null 2>&1 <<OSA
 tell application "Terminal"
   activate
-  do script "cd '$ENG' && claude --session-id '$SID' '$FIRST'"
+  do script "cd '$ENG' && claude --session-id '$SID' \"\$(cat '$ENG/.first_prompt')\""
 end tell
 OSA
   echo "[+] opened an interactive Claude Code session in Terminal, in $ENG"

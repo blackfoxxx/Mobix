@@ -573,7 +573,7 @@ cmd_sessions() {
   done
   [ $n -eq 0 ] && c_dim "  no sessions yet"
   local ne; ne=$(ls -d "$MP_ROOT"/engagements/*/ 2>/dev/null | wc -l | tr -d ' ')
-  [ "$ne" -gt 0 ] 2>/dev/null && c_dim "  $ne Claude Code engagement(s) - see the dashboard's Sessions tab, or: mp engage --resume <name>"
+  [ "$ne" -gt 0 ] 2>/dev/null && c_dim "  $ne agent engagement(s) - see the dashboard's Sessions tab, or: mp engage --resume <name> (claude-tool engagements only)"
   return 0
 }
 
@@ -599,6 +599,14 @@ cmd_engage() {
     [[ "$name" =~ ^[A-Za-z0-9_.-]{1,160}$ ]] || { c_err "invalid engagement name: $name"; exit 1; }
     eng="$MP_ROOT/engagements/$name"
     [ -d "$eng" ] || { c_err "no engagement folder: $eng"; exit 1; }
+    # Engagements from before .tool existed are assumed claude (the only
+    # tool that existed then). OpenCode/Codex engagements DO get a
+    # .session_id written (engage.sh writes one unconditionally), but
+    # neither tool is ever handed that id - only claude --resume means
+    # anything with it - so resuming one by name here would silently hand
+    # a foreign uuid to `claude --resume` instead of erroring clearly.
+    tool=$(cat "$eng/.tool" 2>/dev/null); tool="${tool:-claude}"
+    [ "$tool" = "claude" ] || { c_err "$name was started with --tool $tool; --resume is claude-only for now (open a new engagement instead: mp engage <pkg> --tool $tool)"; exit 1; }
     sid=$(cat "$eng/.session_id" 2>/dev/null)
     [ -z "$sid" ] && { c_err "$name has no saved session id (created before resume support, or auto mode never opened interactively)"; exit 1; }
     osascript >/dev/null 2>&1 <<OSA
@@ -685,10 +693,12 @@ mp - MuMu Android pentest lab
 
  ANALYSE
   mp brief [session]      ranked pentest brief + replay harness  <- start here
-  mp engage [pkg]          full Claude Code session in a target folder
-  mp engage [pkg] --auto   headless agent that reviews the live traffic
+  mp engage [pkg]                    full agent session in a target folder
+  mp engage [pkg] --auto             headless agent that reviews the live traffic
+  mp engage [pkg] --tool opencode    use OpenCode instead of Claude Code (default: claude)
+  mp engage [pkg] --tool codex       use Codex CLI instead (interactive only, no --auto)
   mp engage --stop         stop running engagement agents
-  mp engage --resume <name>  pick a past engagement back up (see: mp sessions)
+  mp engage --resume <name>  pick a past engagement back up (see: mp sessions, Claude Code only)
   mp analyze [session]     full feed (index/surface/flags) + brief
   mp sessions              list capture sessions
   mp static [apk]          static analysis only (apktool + jadx + apkleaks)

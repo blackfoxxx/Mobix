@@ -642,6 +642,7 @@ cmd_static()  {
 }
 cmd_log()   { "$SCRIPTS/launch.sh" --log; }
 cmd_mobsf() { "$SCRIPTS/mobsf.sh" "${1:-start}"; }
+cmd_mcp_http() { "$SCRIPTS/mcp-http.sh" "${1:-status}"; }
 cmd_ca()    { "$SCRIPTS/install-ca.sh" "$@"; }
 cmd_burp()  { "$SCRIPTS/use-burp.sh" "$@"; }
 cmd_doctor() { "$SCRIPTS/selftest.sh" "$@"; }
@@ -703,6 +704,7 @@ mp - MuMu Android pentest lab
   mp sessions              list capture sessions
   mp static [apk]          static analysis only (apktool + jadx + apkleaks)
   mp mobsf  [start]        MobSF at http://127.0.0.1:8010
+  mp mcp-http [start|stop|status]  mp-mcp over HTTP for a tunnel (README: Remote MCP access)
 
  DASHBOARD & SETUP
   mp dash [port]         WEB DASHBOARD - everything in one page (:8090)
@@ -769,6 +771,7 @@ case "${1:-status}" in
   static)    shift; cmd_static "$@" ;;
   log)       cmd_log ;;
   mobsf)     shift; cmd_mobsf "$@" ;;
+  mcp-http)  shift; cmd_mcp_http "$@" ;;
   obj|objection) shift; cmd_obj "$@" ;;
   logcat)    shift; cmd_logcat "$@" ;;
   shell)     shift; cmd_shell "$@" ;;

@@ -17,6 +17,10 @@
 /.capture.pid
 /.launch.pid
 
+# Auto-generated bearer token for mp-mcp --http. A live credential, not
+# config - never commit it.
+/.mcp_http_token
+
 # Target-specific, engagement-tailored scripts (e.g. a real target's
 # request-signing key/algorithm reverse-engineered from a live app).
 # Write your own following the pattern documented in the README.

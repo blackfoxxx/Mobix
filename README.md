@@ -53,6 +53,7 @@ command.
 - [Logging in](#logging-in)
 - [Site map & Repeater](#site-map--repeater)
 - [Wiring traffic into your AI tool (lightweight)](#wiring-traffic-into-your-ai-tool-lightweight)
+- [Remote MCP access (tunnel)](#remote-mcp-access-tunnel)
 - [Bring your own model / OpenRouter](#bring-your-own-model--openrouter)
 - [Static analysis](#static-analysis)
 - [Runtime exploration](#runtime-exploration)
@@ -894,6 +895,86 @@ matters when the target is a live payment system.
 If the body carries a `macIn` field the harness re-signs it automatically via
 `scripts/zc-macin.py`, so patched requests stay valid. For targets without a
 signature the signer is simply absent and the body passes through unchanged.
+
+## Remote MCP access (tunnel)
+
+Everything above registers `bin/mp-mcp` as a **local** MCP server: your
+client launches it as a subprocess and talks to it over stdio, which only
+works for a client running on this same Mac. There's no way to just "host
+mp-mcp in the cloud" instead - most of its tools need this specific
+machine (the MuMu emulator, local adb/frida, the live mitmproxy capture),
+so a cloud platform running the Python script itself would have none of
+that. What *is* possible: keep mp-mcp running here, give it a network
+transport, and put a tunnel in front of it yourself so a remote client -
+Claude.ai's web/desktop remote-MCP connector, a teammate's machine, any
+MCP client that speaks a URL instead of a local command - can reach it.
+
+**1. Start the HTTP transport.** `mp-mcp` normally speaks stdio; `--http`
+serves the same 36 tools over the MCP Streamable HTTP transport instead,
+bound to `127.0.0.1` only:
+
+```bash
+mp mcp-http start     # http://127.0.0.1:8799/mcp, generates+shows a bearer token
+mp mcp-http status     # is it running, and what's the token
+mp mcp-http stop
+```
+
+The bearer token is generated on first run and saved to `.mcp_http_token`
+(mode `600`, gitignored) so it survives a restart; set `MP_MCP_TOKEN` or
+pass `mp-mcp --http --token ...` yourself if you'd rather pick it. **Every
+request needs it** (`Authorization: Bearer <token>`) - there's no
+unauthenticated path, by design: this is the same control plane as the
+local MCP server (scan/switch targets, push a stored credential into a
+focused field, toggle bypasses, start/stop engagements), just reachable
+over a network instead of only to a local subprocess. Treat the token
+exactly like a credential. `MP_MCP_PORT` overrides the port (default
+`8799` - picked to avoid this lab's other local services: mitmproxy on
+`8080`, MobSF on `8010`, the dashboard, etc.).
+
+**2. Put a tunnel in front of it.** Any of these work; pick whichever you
+already trust:
+
+```bash
+cloudflared tunnel --url http://127.0.0.1:8799    # quick, no account needed, *.trycloudflare.com
+ngrok http 8799                                   # needs an ngrok account/authtoken
+tailscale funnel 8799                             # needs Tailscale set up on this Mac already
+```
+
+Each prints a public HTTPS URL. Verified live end-to-end with an ephemeral
+Cloudflare quick tunnel: `tools/list` and a real `tools/call` both round-
+tripped correctly through it, and a request with no/wrong token still got a
+clean 401. One real bug this surfaced and fixed along the way: a tunnel
+pools/reuses connections to the local origin, and the first HTTP/1.1
+implementation here didn't drain a rejected request's body before replying,
+so the next request reusing that connection got corrupted - confirmed live
+(a real `initialize` call came back mangled with the *previous* request's
+leftover bytes). Fixed by reading the body unconditionally before any
+early return, and by dropping keep-alive entirely (`HTTP/1.0`, one request
+per connection) since this is a low-traffic control plane, not something
+that needs persistent connections.
+
+**3. Register the URL with your client**, same shape as any remote MCP
+server:
+
+```bash
+claude mcp add --transport http mobix https://your-tunnel-url/mcp --header "Authorization: Bearer <token>"
+opencode mcp add mobix --url https://your-tunnel-url/mcp --header "Authorization=Bearer <token>"
+MP_MCP_TOKEN=<token> codex mcp add mobix --url https://your-tunnel-url/mcp --bearer-token-env-var MP_MCP_TOKEN
+```
+
+(Codex reads the token from an environment variable rather than taking it
+inline - `--bearer-token-env-var` names *which* variable, so it has to
+actually be set, with the real token value, in whatever shell/profile runs
+`codex` later too, not just the one that ran `mcp add`.)
+
+**Stop the tunnel when you're done.** It's a straight path into a control
+plane that can drive live capture, push stored credentials into whatever's
+focused on the device, and start engagements - don't leave it running
+unattended. The `mp mcp-http` wrapper only ever binds `127.0.0.1` (not
+overridable); `bin/mp-mcp --http` itself does take `--host`, for the rare
+case you're running the tunnel software on another machine on your own
+LAN/Tailscale net - don't point that at `0.0.0.0` without something in
+front of it that actually enforces access control.
 
 ## Bring your own model / OpenRouter
 

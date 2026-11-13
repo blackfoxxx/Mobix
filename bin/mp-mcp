@@ -9,10 +9,14 @@ commands by hand, Claude can query the live capture and drive the lab
 directly — list flows, pull one request in full, start a scan, toggle a
 bypass module, switch target, push a stored credential into a focused field.
 
-Speaks MCP over stdio as newline-delimited JSON-RPC, implemented directly so
-the server has no dependencies beyond the standard library.
+Speaks MCP over stdio as newline-delimited JSON-RPC by default, implemented
+directly so the server has no dependencies beyond the standard library.
+`--http` serves the same tools over the MCP Streamable HTTP transport
+instead (bearer-token auth, binds to localhost only) for reaching this
+process remotely through a tunnel you run yourself - see the README's
+"Remote MCP access" section.
 
-Register once:
+Register once (stdio):
   claude mcp add --scope user mobix ~/mobile-pentest/bin/mp-mcp
 
 Scope, deliberately:
@@ -34,10 +38,14 @@ Scope, deliberately:
 """
 from __future__ import annotations
 
+import argparse
 import base64
+import hmac
+import http.server
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 from pathlib import Path
@@ -885,17 +893,22 @@ BY_NAME = {t["name"]: t for t in TOOLS}
 
 
 # ---------------------------------------------------------------- JSON-RPC
+#
+# handle() is transport-agnostic: it takes one decoded JSON-RPC message and
+# returns the reply dict (or None for a notification, which gets no reply).
+# Writing that dict to a wire format - a newline-delimited stdout line for
+# stdio, an HTTP response body for the --http transport below - is the
+# caller's job, not this function's.
 def reply(mid, result=None, error=None):
     msg = {"jsonrpc": "2.0", "id": mid}
     if error is not None:
         msg["error"] = error
     else:
         msg["result"] = result
-    sys.stdout.write(json.dumps(msg) + "\n")
-    sys.stdout.flush()
+    return msg
 
 
-def handle(msg: dict) -> None:
+def handle(msg: dict) -> dict | None:
     m = msg.get("method")
     mid = msg.get("id")
 
@@ -931,8 +944,8 @@ def handle(msg: dict) -> None:
         return reply(mid, error={"code": -32601, "message": f"method not found: {m}"})
 
 
-def main() -> int:
-    err(f"mobix control plane - traffic from {LOOT}, mp at {MP}")
+def main_stdio() -> int:
+    err(f"mobix control plane (stdio) - traffic from {LOOT}, mp at {MP}")
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -943,11 +956,163 @@ def main() -> int:
             err(f"bad json: {e}")
             continue
         try:
-            handle(msg)
+            resp = handle(msg)
         except Exception as e:
             err(f"handler error: {e}")
+            continue
+        if resp is not None:
+            sys.stdout.write(json.dumps(resp) + "\n")
+            sys.stdout.flush()
+    return 0
+
+
+# ------------------------------------------------------------------ HTTP
+#
+# A local, self-hosted MCP server has no network-reachable transport at all
+# by default - everything above speaks newline-delimited JSON-RPC over
+# stdio, which only works for a process your MCP client launches itself.
+# This adds the MCP "Streamable HTTP" transport so a remote client can reach
+# THIS process over the network: one JSON-RPC message per POST, answered
+# synchronously with a single JSON response. Every tool here already runs
+# synchronously (shell out, wait, return), so there's nothing that needs the
+# server-initiated SSE stream half of that transport - GET is answered 405
+# rather than faked.
+#
+# Binds to 127.0.0.1 ONLY. Reaching it from anywhere else - another
+# machine, the internet - is a deliberately separate step: run a tunnel
+# (cloudflared/ngrok/tailscale funnel) in front of it yourself. See the
+# README's "Remote MCP access" section for why this can't just be "hosted in
+# the cloud" the way a stateless API could (most tools here need this
+# specific Mac: the emulator, local adb/frida, the live mitmproxy capture).
+#
+# Auth is a single static bearer token, not OAuth. The Streamable HTTP spec
+# recommends OAuth for general-purpose remote servers; a static token is a
+# deliberate simplification for the actual trust model here - one operator,
+# one self-managed tunnel they start and stop by hand, not a multi-tenant
+# public service. Treat the token exactly like the credential it is: anyone
+# who has it can drive the whole lab (scan/switch targets, push stored
+# creds into a focused field, replay/resend requests) for as long as the
+# tunnel is up.
+def _load_or_create_token(explicit: str | None) -> str:
+    if explicit:
+        return explicit
+    env = os.environ.get("MP_MCP_TOKEN")
+    if env:
+        return env
+    token_path = ROOT / ".mcp_http_token"
+    try:
+        existing = token_path.read_text().strip()
+        if existing:
+            return existing
+    except FileNotFoundError:
+        pass
+    token = secrets.token_urlsafe(32)
+    token_path.write_text(token + "\n")
+    token_path.chmod(0o600)
+    return token
+
+
+def _make_handler(token: str):
+    class Handler(http.server.BaseHTTPRequestHandler):
+        # HTTP/1.0: one request per connection, no keep-alive. This server
+        # is a low-QPS control plane, not something that needs persistent
+        # connections, and HTTP/1.1 keep-alive turned out to be a real
+        # footgun here - a tunnel (cloudflared, confirmed live) pools
+        # connections to the local origin and reuses them across unrelated
+        # inbound requests, so any response path that didn't fully drain
+        # the previous request's body off the socket first (the 401 path
+        # didn't) left those bytes sitting in the buffer, where they got
+        # parsed as the start of the NEXT request line and corrupted it.
+        # do_POST below still drains the body unconditionally before doing
+        # anything else, belt-and-suspenders, but HTTP/1.0 removes the
+        # whole keep-alive reuse scenario that made the bug reachable.
+        protocol_version = "HTTP/1.0"
+
+        def _json(self, status: int, body: dict | None) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            raw = json.dumps(body).encode() if body is not None else b""
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            if raw:
+                self.wfile.write(raw)
+
+        def _authed(self) -> bool:
+            hdr = self.headers.get("Authorization", "")
+            if not hdr.startswith("Bearer "):
+                return False
+            return hmac.compare_digest(hdr[len("Bearer "):].strip(), token)
+
+        def _unauthorized(self) -> None:
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Bearer realm="mp-mcp"')
+            self.send_header("Content-Type", "application/json")
+            raw = json.dumps({"error": "unauthorized"}).encode()
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_POST(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler's naming)
+            # Read the body off the socket FIRST, unconditionally, before
+            # any early return (auth/path/parse failure) - see the
+            # protocol_version comment above for why.
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length else b""
+            if not self._authed():
+                return self._unauthorized()
+            if self.path.rstrip("/") not in ("", "/mcp"):
+                return self.send_error(404)
+            try:
+                msg = json.loads(raw) if raw else {}
+            except Exception as e:
+                return self.send_error(400, f"bad json: {e}")
+            try:
+                resp = handle(msg)
+            except Exception as e:
+                err(f"http handler error: {e}")
+                resp = {"jsonrpc": "2.0", "id": msg.get("id"),
+                        "error": {"code": -32603, "message": str(e)}}
+            if resp is None:
+                return self._json(202, None)  # notification: no reply body
+            self._json(200, resp)
+
+        def do_GET(self) -> None:  # noqa: N802
+            if not self._authed():
+                return self._unauthorized()
+            self.send_error(405, "no server-initiated stream on this server")
+
+        def log_message(self, fmt, *args) -> None:  # noqa: N802
+            err("http: " + (fmt % args))
+
+    return Handler
+
+
+def main_http(host: str, port: int, token: str) -> int:
+    resolved = _load_or_create_token(token)
+    server = http.server.ThreadingHTTPServer((host, port), _make_handler(resolved))
+    err(f"mobix control plane (http) - listening on http://{host}:{port}/mcp")
+    err(f"bearer token: {resolved}")
+    err("bound to localhost only - put a tunnel in front of it for remote access "
+        "(README: Remote MCP access)")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument("--http", action="store_true",
+                         help="serve the MCP Streamable HTTP transport instead of stdio")
+    parser.add_argument("--host", default="127.0.0.1",
+                         help="bind address for --http (default 127.0.0.1 - do not expose "
+                              "directly; put a tunnel in front of it instead)")
+    parser.add_argument("--port", type=int, default=8799, help="bind port for --http")
+    parser.add_argument("--token", default=None,
+                         help="bearer token for --http (default: $MP_MCP_TOKEN, else "
+                              "read/create ~/mobile-pentest/.mcp_http_token)")
+    args = parser.parse_args()
+    if args.http:
+        raise SystemExit(main_http(args.host, args.port, args.token))
+    raise SystemExit(main_stdio())

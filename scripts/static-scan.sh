@@ -4,7 +4,19 @@
 set -uo pipefail
 . "$(dirname "$0")/env.sh"
 APK="${1:?usage: static-scan.sh <app.apk>}"
-NAME=$(basename "$APK" .apk)
+# Android app bundles always name the main split literally "base.apk", and
+# target_pull always saves to apks/<pkg>/base.apk - so basename(APK) alone is
+# "base" for every target, and every scan silently landed in the same
+# loot/static-base, mixing one target's decompiled sources and leaked secrets
+# into the next target's output (confirmed live: an app.Delivery scan turned
+# up a prior target's FaceTec/Firebase strings mixed into its own apkleaks.txt
+# and jadx/sources). Prefer the package-name parent directory instead.
+PKGDIR=$(basename "$(dirname "$APK")")
+if [ -n "$PKGDIR" ] && [ "$PKGDIR" != "." ] && [ "$PKGDIR" != "/" ]; then
+  NAME="$PKGDIR"
+else
+  NAME=$(basename "$APK" .apk)
+fi
 OUT="$MP_LOOT/static-$NAME"; mkdir -p "$OUT"
 echo "[*] output -> $OUT"
 
@@ -24,10 +36,16 @@ if [ -f "$OUT/apktool/AndroidManifest.xml" ]; then
 fi
 
 echo "=== jadx (java source) ==="
+# jadx has no force-overwrite flag equivalent to apktool's -f, and silently
+# adds to whatever is already in -d rather than replacing it, so re-scanning
+# the same target twice (or, before the NAME fix above, a different target
+# entirely) accumulated stale decompiled classes here indefinitely.
+rm -rf "$OUT/jadx"
 jadx -d "$OUT/jadx" --no-res -q "$APK" >"$OUT/jadx.log" 2>&1
 [ -d "$OUT/jadx/sources" ] && echo "[+] $(find "$OUT/jadx/sources" -name '*.java' | wc -l | tr -d ' ') java files" || echo "[-] jadx produced no sources"
 
 echo "=== apkleaks (secrets/endpoints) ==="
+rm -f "$OUT/apkleaks.txt"
 apkleaks -f "$APK" -o "$OUT/apkleaks.txt" >/dev/null 2>&1 && { echo "[+] $OUT/apkleaks.txt"; head -40 "$OUT/apkleaks.txt"; } || echo "[-] apkleaks failed"
 
 echo "=== pinning indicators in source ==="

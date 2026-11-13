@@ -4,8 +4,9 @@
     "system-certificate-injection": true,
     "certificate-unpinning": true,
     "certificate-unpinning-fallback": true,
-    "disable-root-detection": true,
-    "anti-detection": true
+    "disable-root-detection": false,
+    "anti-detection": false,
+    "facetec-init-bypass": false
   },
   "anti": {
     "Build": true,

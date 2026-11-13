@@ -27,8 +27,8 @@ Java.perform(() => {
     Java.use('java.lang.System').setProperty('https.proxyHost', PROXY_HOST);
     Java.use('java.lang.System').setProperty('https.proxyPort', PROXY_PORT.toString());
 
-    Java.use('java.lang.System').clearProperty('http.nonProxyHosts');
-    Java.use('java.lang.System').clearProperty('https.nonProxyHosts');
+    Java.use('java.lang.System').setProperty('http.nonProxyHosts', 'localhost|127.*|[::1]');
+    Java.use('java.lang.System').setProperty('https.nonProxyHosts', 'localhost|127.*|[::1]');
 
     // Some Android internals attempt to reset these settings to match the device configuration.
     // We block that directly here:
@@ -94,11 +94,26 @@ Java.perform(() => {
         .filter((Cls) => ProxySelector.class.isAssignableFrom(Cls.class));
 
     // Replace the 'select' of every implementation, so they all send traffic to us:
+    // Loopback must NOT be proxied: the app runs its own on-device HTTP server
+    // (MapLibre tile/style server) on 127.0.0.1:<random-port>. Sending that to the
+    // host proxy breaks the map pipeline, so return NO_PROXY for loopback hosts.
+    const noProxyList = Collections.singletonList(ProxyCls.NO_PROXY.value);
+    const isLoopbackHost = (h) => !!h && (h === 'localhost' || h === '::1' || h === '[::1]' || h.startsWith('127.'));
+
     proxySelectorClasses.forEach(ProxySelectorCls => {
         if (DEBUG_MODE) {
             console.log('Rewriting', ProxySelectorCls.toString());
         }
-        ProxySelectorCls.select.implementation = () => getTargetProxyList()
+        ProxySelectorCls.select.implementation = function (uri) {
+            try {
+                const host = uri ? uri.getHost() : null;
+                if (isLoopbackHost(host)) {
+                    if (DEBUG_MODE) console.log('Proxy bypass (loopback):', host);
+                    return noProxyList;
+                }
+            } catch (e) {}
+            return getTargetProxyList();
+        };
     });
 
     console.log(`== Proxy configuration overridden to ${PROXY_HOST}:${PROXY_PORT} ==`);

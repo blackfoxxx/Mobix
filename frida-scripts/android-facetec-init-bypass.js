@@ -53,16 +53,22 @@
     //    at the classloader that actually has it.
     // Handle both: poll for the class to load, and on each attempt search
     // every live classloader rather than trusting the default one.
-    // Re-assert on an interval rather than hooking once and stopping. This
-    // is deliberately not a one-shot: if the hook is ever lost (script
-    // session detaching, the class reloading under a new classloader on a
-    // fresh activity instance, anything else), a plain "hook once, stop
-    // polling" script goes silently unarmed with no visible signal. Re-
-    // hooking an already-hooked method is a harmless no-op, so paying that
-    // small cost forever removes an entire class of "was it actually still
-    // armed when the failure happened" uncertainty.
-    const POLL_MS = 1000;
-    let installCount = 0;
+    // Poll until the class loads, then stop - do NOT keep re-hooking
+    // indefinitely. An earlier version of this script polled forever on a
+    // 1-second timer to work around hooks silently disappearing; the real
+    // cause of that was launching frida with -q, which detaches (and
+    // reverts all hooks) once a script's initial synchronous work settles.
+    // Fixed at the launcher level (no -q). Once that's fixed, indefinite
+    // enumerateClassLoaders() polling is just unnecessary load during the
+    // process's most fragile moment (spawn-time, alongside the rest of the
+    // chain's own hooking) - this app already crashes occasionally under
+    // the full chain even without extra polling on top of it. Back off
+    // instead: check often at first (the class loads within a few seconds
+    // of the liveness screen opening), then increasingly rarely, and give
+    // up after a generous ceiling rather than polling forever.
+    const MAX_ATTEMPTS = 60; // ~10 minutes total with the backoff below
+    let attempt = 0;
+    let hooked = false;
 
     function findLoaderFor(className) {
         let found = null;
@@ -79,8 +85,10 @@
     }
 
     function tryHook() {
+        if (hooked) return;
         Java.perform(function () {
             for (const cls of CANDIDATE_CLASSES) {
+                if (hooked) break;
                 const loader = findLoaderFor(cls);
                 if (!loader) continue; // not loaded by any classloader yet
                 try {
@@ -92,14 +100,20 @@
                         this.onCompletion(true);
                     };
                     Java.classFactory.loader = prevLoader;
-                    installCount++;
-                    say('hook (re)installed on ' + cls + '.onCompletion, install #' + installCount);
+                    say('hooked ' + cls + '.onCompletion');
+                    hooked = true;
                 } catch (e) {
                     say('found ' + cls + ' but hook install failed: ' + e);
                 }
             }
         });
-        setTimeout(tryHook, POLL_MS);
+        attempt++;
+        if (!hooked && attempt < MAX_ATTEMPTS) {
+            const delay = Math.min(1000 * Math.pow(1.15, attempt), 30000);
+            setTimeout(tryHook, delay);
+        } else if (!hooked) {
+            say('gave up waiting for ' + CANDIDATE_CLASSES.join(',') + ' to load');
+        }
     }
 
     tryHook();

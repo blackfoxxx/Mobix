@@ -14,6 +14,8 @@ but the blast radius of a remote caller would still be the whole toolkit.
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import re
@@ -580,6 +582,7 @@ _SIGNER_TRIED = False
 
 
 _CREDS_MOD = None
+_MODELS_MOD = None
 
 
 def creds_mod():
@@ -595,6 +598,32 @@ def creds_mod():
         spec.loader.exec_module(mod)
         _CREDS_MOD = mod
     return _CREDS_MOD
+
+
+def models_mod():
+    """Lazily load scripts/models.py - same trick as creds_mod(), so the
+    registry format and validation (schema enum, url-required-unless-
+    openrouter, etc.) has exactly one implementation, shared with `mp
+    model`. The dashboard calls its cmd_* functions directly (capturing
+    their stdout) rather than re-deriving the same checks here."""
+    global _MODELS_MOD
+    if _MODELS_MOD is None:
+        import importlib.util
+        path = SCRIPTS / "models.py"
+        spec = importlib.util.spec_from_file_location("mp_models", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _MODELS_MOD = mod
+    return _MODELS_MOD
+
+
+def run_cmd(fn, argv: list[str]) -> tuple[bool, str]:
+    """Call one of models.py's cmd_* functions in-process, capturing its
+    stdout the same way a subprocess's stdout would read."""
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = fn(argv)
+    return rc == 0, buf.getvalue().strip()
 
 
 def repeater_signer():
@@ -923,6 +952,7 @@ h3{font-size:11px;text-transform:uppercase;letter-spacing:.07em;color:var(--mut)
   <button class="on" data-t="traffic" onclick="tab('traffic')">Traffic</button>
   <button data-t="repeater" onclick="tab('repeater')">Repeater</button>
   <button data-t="login" onclick="tab('login')">Login</button>
+  <button data-t="models" onclick="tab('models')">Models</button>
   <button data-t="bypass" onclick="tab('bypass')">Bypass</button>
   <button data-t="apps" onclick="tab('apps')">Apps</button>
   <button data-t="services" onclick="tab('services')">Services</button>
@@ -1030,6 +1060,38 @@ h3{font-size:11px;text-transform:uppercase;letter-spacing:.07em;color:var(--mut)
 
         <h2 style="margin-top:20px">Notes</h2>
         <textarea id="credNotes" class="rtext" style="height:80px" placeholder="e.g. Login screen: email+password, then OTP sent by SMS to +964…"></textarea>
+      </div>
+    </div>
+  </section>
+
+  <!-- MODELS -->
+  <section id="t-models" class="tab">
+    <div class="grid" style="max-width:900px">
+      <div class="card" style="grid-column:1/-1">
+        <div class="cwarn">Stored locally, unencrypted, at <code>~/mobile-pentest/models.json</code>
+          (file mode 600) - unlike the Login tab's test-account creds, these are
+          real API keys. Only wired up for <code>mp engage --tool opencode</code>
+          right now: Claude Code has no bring-your-own-model mechanism of its own,
+          and Codex isn't wired in yet. See the README's "Bring your own model"
+          section for the three supported schemas.</div>
+
+        <h2>Registered providers <span id="modelCount" class="muted" style="text-transform:none;font-weight:400"></span></h2>
+        <div id="modelRows"></div>
+
+        <h2 style="margin-top:20px">Add a provider</h2>
+        <input id="modelName" placeholder="name (e.g. my-vllm)" style="width:100%">
+        <select id="modelSchema" style="width:100%;margin-top:8px">
+          <option value="openai-compatible">openai-compatible - anything speaking OpenAI's chat-completions shape</option>
+          <option value="openrouter">openrouter</option>
+          <option value="anthropic-compatible">anthropic-compatible - speaks Anthropic's Messages API shape</option>
+        </select>
+        <input id="modelUrl" placeholder="base URL, e.g. http://127.0.0.1:11434/v1 (not needed for openrouter)" style="width:100%;margin-top:8px">
+        <input id="modelKey" type="password" placeholder="API key" style="width:100%;margin-top:8px">
+        <input id="modelModels" placeholder="model id(s), comma-separated, e.g. llama3.1:8b, llama3.1:70b" style="width:100%;margin-top:8px">
+        <input id="modelEnv" placeholder="env var name (optional - default: <NAME>_API_KEY)" style="width:100%;margin-top:8px">
+        <div class="btns" style="margin-top:10px;justify-content:flex-end">
+          <button class="primary" onclick="addModel()">Add</button>
+        </div>
       </div>
     </div>
   </section>
@@ -1301,6 +1363,55 @@ async function bringFront(){
 }
 function escAttr(s){ return esc(s).replace(/"/g,'&quot;'); }
 
+async function loadModels(){
+  const d=await (await fetch('/api/model')).json();
+  const names=Object.keys(d.providers||{});
+  $('modelCount').textContent = names.length? '('+names.length+')' : '';
+  if(!names.length){
+    $('modelRows').innerHTML='<div class="muted" style="padding:8px 0">none registered yet - add one below</div>';
+    return;
+  }
+  $('modelRows').innerHTML=names.map(function(name){
+    const p=d.providers[name], active=d.active===name;
+    return '<div style="display:flex;gap:10px;align-items:center;padding:8px 0;border-bottom:1px solid var(--line);flex-wrap:wrap">'
+      +'<b>'+esc(name)+'</b>'+(active?' <span class="ok">(active)</span>':'')
+      +'<span class="muted">'+esc(p.schema)+(p.base_url?' · '+esc(p.base_url):'')+'</span>'
+      +'<span class="muted">key '+esc(p.key_masked||'(none)')+' · env '+esc(p.env_var)+'</span>'
+      +'<span class="muted">'+esc((p.models||[]).join(', '))+'</span>'
+      +'<span style="flex:1"></span>'
+      +(active?'':'<button onclick="useModel(\''+esc(name)+'\')">Use</button>')
+      +'<button onclick="removeModel(\''+esc(name)+'\')">Remove</button>'
+      +'</div>';
+  }).join('');
+}
+async function addModel(){
+  const name=$('modelName').value.trim();
+  if(!name){ alert('enter a name'); return; }
+  const models=$('modelModels').value.split(',').map(function(s){return s.trim()}).filter(Boolean);
+  const r=await (await fetch('/api/model',{method:'POST',headers:{'content-type':'application/json'},
+    body:JSON.stringify({op:'add', name:name, schema:$('modelSchema').value,
+      url:$('modelUrl').value.trim(), key:$('modelKey').value, models:models,
+      env_var:$('modelEnv').value.trim()})})).json();
+  $('log').textContent=r.ok?('added '+esc(name)):('add failed: '+esc(r.out||''));
+  if(r.ok){
+    $('modelName').value=''; $('modelUrl').value=''; $('modelKey').value='';
+    $('modelModels').value=''; $('modelEnv').value='';
+    loadModels();
+  }
+}
+async function useModel(name){
+  const r=await (await fetch('/api/model',{method:'POST',headers:{'content-type':'application/json'},
+    body:JSON.stringify({op:'use', name:name})})).json();
+  $('log').textContent=r.ok?(esc(name)+' is now active for mp engage --tool opencode'):('failed: '+esc(r.out||''));
+  if(r.ok) loadModels();
+}
+async function removeModel(name){
+  const r=await (await fetch('/api/model',{method:'POST',headers:{'content-type':'application/json'},
+    body:JSON.stringify({op:'remove', name:name})})).json();
+  $('log').textContent=r.ok?('removed '+esc(name)):('failed: '+esc(r.out||''));
+  if(r.ok) loadModels();
+}
+
 async function loadBurpStatus(){
   const port=($('burpPort').value||'8080').trim();
   try{
@@ -1383,7 +1494,7 @@ function loadRepHistory(idx){
 function theme(){const r=document.documentElement;const d=r.dataset.theme||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light');r.dataset.theme=d==='dark'?'light':'dark'}
 function tab(n){document.querySelectorAll('.tab').forEach(e=>e.classList.remove('on'));$('t-'+n).classList.add('on');
   document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('on',b.dataset.t===n));
-  if(n==='bypass')loadBypass(); if(n==='apps')loadApps(); if(n==='engage'){pollEng();var d=$('engnavdot');if(d)d.style.display='none';} if(n==='install')pollInstall(); if(n==='login'&&!CREDPKG)loadCredsForCurrentTarget(); if(n==='services')loadBurpStatus(); if(n==='sessions')loadSessions();}
+  if(n==='bypass')loadBypass(); if(n==='apps')loadApps(); if(n==='engage'){pollEng();var d=$('engnavdot');if(d)d.style.display='none';} if(n==='install')pollInstall(); if(n==='login'&&!CREDPKG)loadCredsForCurrentTarget(); if(n==='models')loadModels(); if(n==='services')loadBurpStatus(); if(n==='sessions')loadSessions();}
 function dot(v){return `<span class="dot" style="background:${v?'var(--ok)':'var(--bad)'}"></span>`}
 function row(k,v){return `<div class="row"><b>${k}</b><span>${v}</span></div>`}
 // Captured-traffic values (host, path, headers) are attacker-controlled by
@@ -1816,6 +1927,18 @@ class H(BaseHTTPRequestHandler):
             if not pkg:
                 return self._send(400, json.dumps({"error": "pkg required"}))
             return self._send(200, json.dumps(creds_mod().load(pkg)))
+        if u.path == "/api/model":
+            mm = models_mod()
+            d = mm.load()
+            out = {"active": d.get("active"), "providers": {}}
+            for name, p in d["providers"].items():
+                key = p.get("api_key", "")
+                out["providers"][name] = {
+                    "schema": p.get("schema"), "base_url": p.get("base_url"),
+                    "env_var": p.get("env_var"), "models": p.get("models", []),
+                    "key_masked": "*" * min(len(key), 12) if key else "",
+                }
+            return self._send(200, json.dumps(out))
         if u.path == "/api/totp":
             q = parse_qs(u.query)
             secret = (q.get("secret") or [""])[0]
@@ -1943,6 +2066,37 @@ class H(BaseHTTPRequestHandler):
                 return self._send(400, json.dumps({"ok": False, "out": "unrecognised source"}))
             run_install(src, bool(body.get("passive")))
             return self._send(200, json.dumps({"ok": True, "out": "install started — watch the log"}))
+        if path == "/api/model":
+            n = int(self.headers.get("Content-Length") or 0)
+            try:
+                body = json.loads(self.rfile.read(n) or b"{}")
+            except Exception:
+                return self._send(400, json.dumps({"ok": False, "out": "bad json"}))
+            mm = models_mod()
+            op = str(body.get("op", "")).strip()
+            if op == "add":
+                name = str(body.get("name", "")).strip()
+                argv = [name, "--schema", str(body.get("schema", "")).strip()]
+                url = str(body.get("url", "")).strip()
+                if url:
+                    argv += ["--url", url]
+                argv += ["--key", str(body.get("key", "")).strip()]
+                for m in (body.get("models") or []):
+                    m = str(m).strip()
+                    if m:
+                        argv += ["--model", m]
+                env_var = str(body.get("env_var", "")).strip()
+                if env_var:
+                    argv += ["--env", env_var]
+                ok, out = run_cmd(mm.cmd_add, argv)
+                return self._send(200, json.dumps({"ok": ok, "out": out}))
+            if op == "remove":
+                ok, out = run_cmd(mm.cmd_remove, [str(body.get("name", "")).strip()])
+                return self._send(200, json.dumps({"ok": ok, "out": out}))
+            if op == "use":
+                ok, out = run_cmd(mm.cmd_use, [str(body.get("name", "")).strip()])
+                return self._send(200, json.dumps({"ok": ok, "out": out}))
+            return self._send(400, json.dumps({"ok": False, "out": f"unknown op: {op}"}))
         if path != "/api/action":
             return self._send(404, json.dumps({"error": "not found"}))
         n = int(self.headers.get("Content-Length") or 0)

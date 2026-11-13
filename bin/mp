@@ -657,6 +657,7 @@ cmd_login() {
   python3 "$SCRIPTS/creds.py" show "$pkg" "${@:2}"
 }
 cmd_creds() { python3 "$SCRIPTS/creds.py" "$@"; }
+cmd_model() { python3 "$SCRIPTS/models.py" "$@"; }
 cmd_shell() { A shell "$@"; }
 cmd_obj()   { need_target; objection -g "${1:-$TARGET}" explore; }
 cmd_logcat(){
@@ -698,6 +699,7 @@ mp - MuMu Android pentest lab
   mp engage [pkg] --auto             headless agent that reviews the live traffic
   mp engage [pkg] --tool opencode    use OpenCode instead of Claude Code (default: claude)
   mp engage [pkg] --tool codex       use Codex CLI instead (interactive only, no --auto)
+  mp engage [pkg] --tool opencode --model <name>  use a registered API instead (see: mp model)
   mp engage --stop         stop running engagement agents
   mp engage --resume <name>  pick a past engagement back up (see: mp sessions, Claude Code only)
   mp analyze [session]     full feed (index/surface/flags) + brief
@@ -733,6 +735,14 @@ mp - MuMu Android pentest lab
   mp creds rm  <pkg> <label>
   mp creds type <pkg> <label>   tap the field on-screen FIRST, then this
                                 sends that value (or live TOTP code) to it
+
+ MODELS  (bring your own API for mp engage --tool opencode - README: Bring
+          your own model)
+  mp model add <name> --schema openai-compatible --url <url> --key <key> --model <id>
+                       (--schema openrouter|anthropic-compatible also supported)
+  mp model list
+  mp model remove <name>
+  mp model use <name>     set the default for mp engage --tool opencode
 
  MISC
   mp obj    [pkg]        objection explore
@@ -780,6 +790,7 @@ case "${1:-status}" in
   doctor)    shift; cmd_doctor "$@" ;;
   login)     shift; cmd_login "$@" ;;
   creds)     shift; cmd_creds "$@" ;;
+  model)     shift; cmd_model "$@" ;;
   help|-h|--help) cmd_help ;;
   *) c_err "unknown command: $1"; echo; cmd_help; exit 1 ;;
 esac

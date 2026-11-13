@@ -10,6 +10,9 @@
 #   engage.sh [pkg] --auto               headless agent, streaming to scan.log
 #   engage.sh [pkg] --tool opencode       use OpenCode instead of Claude Code
 #   engage.sh [pkg] --tool codex          use Codex CLI instead of Claude Code
+#   engage.sh [pkg] --tool opencode --model <name>   use a registered custom
+#                                          API instead (see: mp model, the
+#                                          README's "Bring your own model")
 #
 # --tool defaults to AGENT_TOOL in config, or "claude" if unset. All three
 # read the same per-engagement CLAUDE.md and the same methodology (Claude
@@ -33,21 +36,30 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 
 MODE="interactive"
 TOOL=""
+MODEL=""
 PKG=""
 prev=""
 for a in "$@"; do
   case "$a" in
     --auto) MODE="auto" ;;
     --tool) prev="tool" ;;
+    --model) prev="model" ;;
     -*) ;;
     *)
-      if [ "$prev" = "tool" ]; then TOOL="$a"; prev=""; else PKG="$a"; fi
+      case "$prev" in
+        tool) TOOL="$a" ;;
+        model) MODEL="$a" ;;
+        *) PKG="$a" ;;
+      esac
+      prev=""
       ;;
   esac
 done
 [ -z "$TOOL" ] && TOOL=$(grep -E '^AGENT_TOOL=' "$MP_ROOT/config" 2>/dev/null | cut -d'"' -f2)
 [ -z "$TOOL" ] && TOOL="claude"
 [[ "$TOOL" =~ ^(claude|opencode|codex)$ ]] || { echo "unknown --tool: $TOOL (expected: claude, opencode, codex)" >&2; exit 1; }
+[ -n "$MODEL" ] && [ "$TOOL" != "opencode" ] && { echo "--model <name> is only wired up for --tool opencode right now" >&2; exit 1; }
+[[ "$MODEL" =~ ^[A-Za-z0-9_-]{0,80}$ ]] || { echo "invalid --model name: $MODEL" >&2; exit 1; }
 [ -z "$PKG" ] && PKG=$(grep -E '^TARGET=' "$MP_ROOT/config" 2>/dev/null | cut -d'"' -f2)
 [ -z "$PKG" ] && { echo "usage: engage.sh <package> [--auto] [--tool claude|opencode|codex]"; exit 1; }
 [ "$TOOL" = "codex" ] && [ "$MODE" = "auto" ] && { echo "--tool codex is interactive-only for now: its --auto boundary isn't a verified tool-ACL like claude/opencode's (see the comment at the top of this file). Drop --auto, or use --tool claude/opencode." >&2; exit 1; }
@@ -155,6 +167,18 @@ echo "[*] target: $PKG   scope: ${SCOPE:-none}   traffic: ${SESS:+$(basename "$S
 printf '%s' "$FIRST" > "$ENG/.first_prompt"
 
 if [ "$TOOL" = "opencode" ]; then
+  # Whichever provider ends up selected ($MODEL if given, else models.py's
+  # own persisted "active", else none) needs its opencode.jsonc providers
+  # block written AND its API key actually present in opencode's process
+  # environment - neither happens on its own. ${MODEL:+"$MODEL"} (not bare
+  # "$MODEL") matters here: with MODEL unset this must pass NO argument at
+  # all to models.py, not an empty-string one - an explicit "" argument
+  # would be read as "look up a provider literally named ''" rather than
+  # "fall back to whatever's active", which is not the same thing.
+  python3 "$DIR/models.py" sync ${MODEL:+--as "$MODEL"} >/dev/null 2>&1
+  OC_MODEL="$(python3 "$DIR/models.py" resolve ${MODEL:+"$MODEL"} 2>/dev/null)"
+  eval "$(python3 "$DIR/models.py" env ${MODEL:+"$MODEL"} 2>/dev/null)"
+  python3 "$DIR/models.py" env ${MODEL:+"$MODEL"} > "$ENG/.model_env" 2>/dev/null
   if [ "$MODE" = "auto" ]; then
     echo "[*] starting headless OpenCode agent (analysis-only). streaming -> $ENG/scan.log"
     # mobix-auto (.opencode/agent/mobix-auto.md, shipped with this repo) is the
@@ -166,16 +190,27 @@ if [ "$TOOL" = "opencode" ]; then
     # flag) does not loosen an explicit deny either.
     nohup opencode run --agent mobix-auto --dir "$ENG" \
       --format json \
+      ${OC_MODEL:+--model "$OC_MODEL"} \
       "$(cat "$ENG/.first_prompt")" \
       > "$ENG/scan.log" 2>&1 &
     echo $! > "$ENG/.agent.pid"
     echo "[+] agent pid $(cat "$ENG/.agent.pid")  -  tail -f $ENG/scan.log"
     echo "$ENG"
   else
+    # Bare `opencode` (unlike `opencode run`) has no --agent flag at all -
+    # confirmed live (ERROR Unrecognized flag: --agent), not assumed. The
+    # interactive session's agent is picked via opencode.jsonc's
+    # "default_agent": "mobix-interactive" instead (set in this repo's own
+    # opencode.jsonc), which is also why interactive mode only works from
+    # inside this repo's config scope, same as mobix-auto needing the
+    # mp-traffic MCP server registered the same way.
+    # .model_env (written above, same "route it through a file" reasoning
+    # as .first_prompt below) sources cleanly even when empty - no API key
+    # registered means nothing to export, not an error.
     osascript >/dev/null 2>&1 <<OSA
 tell application "Terminal"
   activate
-  do script "cd '$ENG' && opencode --agent mobix-interactive --prompt \"\$(cat '$ENG/.first_prompt')\""
+  do script "cd '$ENG' && . '$ENG/.model_env' 2>/dev/null; opencode --prompt \"\$(cat '$ENG/.first_prompt')\""
 end tell
 OSA
     echo "[+] opened an interactive OpenCode session in Terminal, in $ENG"

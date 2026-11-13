@@ -54,7 +54,7 @@ command.
 - [Site map & Repeater](#site-map--repeater)
 - [Wiring traffic into your AI tool (lightweight)](#wiring-traffic-into-your-ai-tool-lightweight)
 - [Remote MCP access (tunnel)](#remote-mcp-access-tunnel)
-- [Bring your own model / OpenRouter](#bring-your-own-model--openrouter)
+- [Bring your own model](#bring-your-own-model)
 - [Static analysis](#static-analysis)
 - [Runtime exploration](#runtime-exploration)
 - [Installing an app](#installing-an-app)
@@ -537,10 +537,13 @@ mp engage                          # interactive session in a new Terminal, in t
 mp engage <pkg> --auto             # headless agent: reviews the live capture, writes findings
 mp engage <pkg> --tool opencode    # same, driven by OpenCode instead of Claude Code
 mp engage <pkg> --tool codex       # same, driven by Codex CLI (interactive only - see below)
+mp engage <pkg> --tool opencode --model my-vllm  # use a registered custom API - see: mp model
 mp engage --stop                   # stop running agents
 ```
 
 `--tool` defaults to `AGENT_TOOL` in `config` if set, otherwise `claude`.
+`--model` (opencode only) defaults to whatever `mp model use` last set, if
+anything - see [Bring your own model](#bring-your-own-model).
 
 | | `claude` | `opencode` | `codex` |
 |---|---|---|---|
@@ -568,7 +571,11 @@ buttons aren't wired to them yet - drive those two from the CLI for now.
 **Interactive mode** opens a real `claude`/`opencode`/`codex` session in
 Terminal.app in that folder, with full tool access, permissions and MCP -
 functionally identical to starting that CLI by hand in the engagement
-folder. **`--auto` mode** (claude/opencode only) runs a headless agent
+folder. For OpenCode specifically, which agent it starts with is set via
+`opencode.jsonc`'s `"default_agent": "mobix-interactive"` (this repo's own
+config), not a CLI flag - bare `opencode` has no `--agent` flag at all
+(confirmed live: `ERROR Unrecognized flag: --agent`, not assumed), unlike
+`opencode run`, which does. **`--auto` mode** (claude/opencode only) runs a headless agent
 restricted to the 6 read-only `traffic_*` tools plus Read/Write/Grep/Skill,
 **no Bash, no request sending**. For Claude Code that restriction is enforced
 with an explicit `--disallowedTools` deny list, not just by leaving
@@ -976,52 +983,71 @@ case you're running the tunnel software on another machine on your own
 LAN/Tailscale net - don't point that at `0.0.0.0` without something in
 front of it that actually enforces access control.
 
-## Bring your own model / OpenRouter
+## Bring your own model
 
 `--tool` picks the CLI that drives the engagement; which *model* that CLI
-talks to is a separate, orthogonal choice this lab doesn't touch at all -
-OpenCode and Codex CLI both support custom OpenAI-compatible backends
-(OpenRouter, a local vLLM/Ollama/llama.cpp server, etc.) in their own
-config, so pointing `mp engage --tool opencode` or `--tool codex` at one is
-just a matter of configuring that tool normally before running `mp engage`.
-Claude Code has no such mechanism - it only talks to Anthropic's API - so
-this only applies to `--tool opencode`/`--tool codex`.
+talks to is a separate, orthogonal choice. `mp model` (CLI) and the
+dashboard's **Models** tab register a custom API for `mp engage --tool
+opencode` to use - a self-hosted vLLM/Ollama/llama.cpp server, OpenRouter,
+a corporate LLM gateway, anything OpenAI-chat-completions- or
+Anthropic-Messages-shaped. Claude Code has no bring-your-own-model
+mechanism of its own (it only talks to Anthropic's API), and Codex isn't
+wired into this yet (see the Codex note at the end) - so this only applies
+to `--tool opencode` for now.
 
-**OpenCode.** Add a provider to `opencode.jsonc` (project-level, in this repo,
-or `~/.config/opencode/opencode.jsonc` for every project) using the
-`@ai-sdk/openai-compatible` connector and any base URL:
-
-```jsonc
-{
-  "provider": {
-    "openrouter": {
-      "name": "OpenRouter",
-      "npm": "@ai-sdk/openai-compatible",
-      "options": { "baseURL": "https://openrouter.ai/api/v1" },
-      "models": { "anthropic/claude-sonnet-4.5": { "name": "Claude Sonnet 4.5 (via OpenRouter)" } }
-    }
-  }
-}
+```bash
+mp model add my-vllm --schema openai-compatible \
+  --url http://127.0.0.1:11434/v1 --key sk-... --model llama3.1:8b
+mp model list
+mp model use my-vllm      # default for every subsequent `mp engage --tool opencode`
+mp model remove my-vllm
 ```
 
-then `OPENROUTER_API_KEY=sk-or-... mp engage <pkg> --tool opencode`. The exact
-same shape works for any other OpenAI-compatible endpoint - swap the
-`baseURL` and model id. OpenCode may also have a built-in `openrouter`
-integration you can set up with `opencode auth login openrouter` instead of
-hand-writing the block above; check `opencode auth login --help` for what
-your installed version offers.
+Three schemas, matching how OpenCode itself categorises provider APIs (see
+[opencode.ai/docs/providers](https://opencode.ai/docs/providers)):
+`openai-compatible` (anything speaking OpenAI's chat-completions shape -
+the common case), `openrouter` (OpenRouter specifically, or a compatible
+gateway in front of it - `--url` is optional, it defaults to OpenRouter's
+own endpoint), and `anthropic-compatible` (an endpoint speaking Anthropic's
+Messages API shape instead).
 
-**Codex CLI.** Custom backends go in `~/.codex/config.toml` under
-`[model_providers.<id>]` (`base_url`, `env_key`, `wire_api`, etc. - run
-`codex doctor` or check Codex's own docs for the full field list for your
-installed version), then select it with `model_provider = "<id>"` either in
-the base config or a `--profile` overlay. **Verify `wire_api` against your
-own install before relying on this**: the Codex build this was written
-against rejects `wire_api = "chat"` outright ("no longer supported"), which
-is the setting most OpenAI-Chat-Completions-shaped backends (OpenRouter
-included) need - the standalone open-source Codex CLI may differ from the
-one this was checked against. If `chat` doesn't work on yours, check whether
-your provider also offers an OpenAI *Responses*-API-compatible endpoint.
+`mp engage <pkg> --tool opencode --model my-vllm` uses that provider for
+one engagement without changing the persisted default; omit `--model` to
+use whatever `mp model use` last set. Either way, two things happen that
+you'd otherwise have to do by hand: the provider's API key is exported into
+OpenCode's process environment (the key is never written into
+`opencode.jsonc` itself - only the env var *name* is, matching how OpenCode
+expects to read it), and `opencode.jsonc`'s `providers` block (and, for the
+active one, the top-level `model` default) is kept in sync automatically.
+`mp model` owns the `providers` entries it creates and the top-level
+`model` key outright - it recomputes `model` from scratch on every change
+(clearing it if nothing is active) rather than risking a stale reference to
+a provider that no longer exists, and never touches a `providers` entry it
+didn't create itself.
+
+Storage: `~/mobile-pentest/models.json`, mode `600`, gitignored - same
+local/unencrypted caveat as the Login tab's device creds, except these are
+real API keys, not throwaway test accounts. Back it up/rotate it like any
+other credential store.
+
+**Dashboard.** The **Models** tab does the same thing visually: a form to
+add a provider (name, schema, base URL, key, comma-separated model ids), a
+list of registered providers with **Use**/**Remove** per row, masked keys.
+Backed by the exact same `scripts/models.py` code the CLI calls, so the two
+never drift.
+
+**Codex CLI note.** Custom backends in Codex go in `~/.codex/config.toml`
+under `[model_providers.<id>]` (`base_url`, `env_key`, `wire_api`, etc. -
+run `codex doctor` or check Codex's own docs for the full field list for
+your installed version), selected via `model_provider = "<id>"`. This isn't
+wired into `mp model`/`mp engage` yet, for a concrete reason: the Codex
+build this was checked against rejects `wire_api = "chat"` outright ("no
+longer supported") - the setting most OpenAI-chat-completions-shaped
+backends (OpenRouter included) need - so the right schema/field mapping for
+Codex isn't settled the way OpenCode's `providers.<name>.package` values
+are. If you configure it by hand and it works on your install, `mp engage
+--tool codex` will still pick up whatever model Codex itself is configured
+to use by default; it just won't be `mp model`-managed.
 
 ## Static analysis
 
